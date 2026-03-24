@@ -13,6 +13,7 @@ import sys
 import os
 import json
 import datetime
+import signal
 import shutil
 import threading
 import time
@@ -49,35 +50,98 @@ def banner():
 {M}{'─'*70}{RST}
 """)
 
-def info(msg):  print(f"{B}[*]{RST} {msg}")
-def ok(msg):    print(f"{G}[+]{RST} {msg}")
-def warn(msg):  print(f"{Y}[!]{RST} {msg}")
-def err(msg):   print(f"{R}[-]{RST} {msg}")
-def phase(n, title): print(f"\n{C}{BOLD}{'─'*60}{RST}\n{M}{BOLD}  Phase {n} — {title}{RST}\n{C}{BOLD}{'─'*60}{RST}")
+# ─── Background Mode Detection ────────────────────────────────────────────────
+_bg_mode = threading.local()
+
+def _is_background():
+    return getattr(_bg_mode, 'active', False)
+
+def _log_prefix():
+    if _is_background():
+        name = getattr(_bg_mode, 'name', '?')
+        return f"{M}[BG:{name}]{RST} "
+    return ""
+
+def info(msg):  print(f"{_log_prefix()}{B}[*]{RST} {msg}")
+def ok(msg):    print(f"{_log_prefix()}{G}[+]{RST} {msg}")
+def warn(msg):  print(f"{_log_prefix()}{Y}[!]{RST} {msg}")
+def err(msg):   print(f"{_log_prefix()}{R}[-]{RST} {msg}")
+def phase(n, title):
+    pfx = _log_prefix()
+    print(f"\n{pfx}{C}{BOLD}{'─'*60}{RST}\n{pfx}{M}{BOLD}  Phase {n} — {title}{RST}\n{pfx}{C}{BOLD}{'─'*60}{RST}")
+
+# ─── Task Registry ────────────────────────────────────────────────────────────
+_bg_registry = {}
+_fg_current = {"name": None, "proc": None, "start": 0}
+_bg_lock = threading.Lock()
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def tool_exists(name):
     return shutil.which(name) is not None
 
+def _kill_proc(proc):
+    """Cross-platform process tree kill: SIGTERM/SIGKILL on Linux, TerminateProcess on Windows."""
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    else:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        if sys.platform != "win32":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
 def run(cmd, output_file=None, shell=True, tool_name=None):
     """
     Streams stdout/stderr in real-time via Popen.
-    No timeout — every tool runs until it finishes naturally.
-    Ctrl+C skips the current tool without aborting the pipeline.
+    Foreground: Ctrl+C opens interactive kill menu.
+    Background: runs silently, proc registered for remote kill.
     """
+    is_bg = _is_background()
+
     info(f"Running: {Y}{cmd}{RST}")
-    if tool_name:
-        info(f"{C}{tool_name}{RST} | {W}Ctrl+C to skip{RST}")
+    if tool_name and not is_bg:
+        info(f"{C}{tool_name}{RST} | {W}Ctrl+C to manage tasks{RST}")
+
+    popen_kwargs = {
+        "shell": shell,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(
-            cmd, shell=shell,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
         err(f"Failed to start: {e}")
         return ""
+
+    if is_bg:
+        bg_name = getattr(_bg_mode, 'name', '')
+        with _bg_lock:
+            if bg_name in _bg_registry:
+                _bg_registry[bg_name]["proc"] = proc
+    else:
+        _fg_current["name"] = tool_name
+        _fg_current["proc"] = proc
+        _fg_current["start"] = time.time()
 
     stdout_lines = []
 
@@ -85,12 +149,13 @@ def run(cmd, output_file=None, shell=True, tool_name=None):
         for line in iter(stream.readline, ""):
             if collector is not None:
                 collector.append(line)
-            stripped = line.rstrip()
-            if stripped:
-                if is_stderr:
-                    print(f"  {Y}{stripped}{RST}")
-                else:
-                    print(f"  {stripped}")
+            if not is_bg:
+                stripped = line.rstrip()
+                if stripped:
+                    if is_stderr:
+                        print(f"  {Y}{stripped}{RST}")
+                    else:
+                        print(f"  {stripped}")
         stream.close()
 
     t_out = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines, False), daemon=True)
@@ -100,22 +165,43 @@ def run(cmd, output_file=None, shell=True, tool_name=None):
 
     killed = False
     start = time.time()
-    try:
+
+    if is_bg:
         proc.wait()
-    except KeyboardInterrupt:
-        warn(f"Skipping {tool_name or 'current tool'}...")
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
+    else:
+        while True:
             try:
-                proc.kill()
-            except OSError:
-                pass
-        killed = True
+                proc.wait()
+                break
+            except KeyboardInterrupt:
+                action, target_name = _show_kill_menu()
+                if action == "cancel":
+                    if proc.poll() is not None:
+                        break
+                    continue
+                elif action == "kill_one" and target_name == tool_name:
+                    _kill_proc(proc)
+                    killed = True
+                    break
+                elif action == "kill_one":
+                    _kill_bg_task(target_name)
+                    if proc.poll() is not None:
+                        break
+                    continue
+                elif action == "kill_all":
+                    _kill_proc(proc)
+                    _kill_all_bg()
+                    killed = True
+                    break
+                elif action == "abort":
+                    _kill_proc(proc)
+                    _kill_all_bg()
+                    killed = True
+                    raise
+
+    if not is_bg:
+        _fg_current["name"] = None
+        _fg_current["proc"] = None
 
     t_out.join(timeout=2)
     t_err.join(timeout=2)
@@ -152,6 +238,144 @@ def send_telegram(token, chat_id, message):
         requests.post(url, data={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
         warn(f"Telegram failed: {e}")
+
+# ─── Kill Menu & Background Task Management ──────────────────────────────────
+
+def _show_kill_menu():
+    """Interactive menu shown on Ctrl+C — pick which task to kill."""
+    tasks = []
+    if _fg_current["name"] and _fg_current["proc"] and _fg_current["proc"].poll() is None:
+        elapsed = time.time() - _fg_current["start"]
+        tasks.append(("FG", _fg_current["name"], elapsed))
+    with _bg_lock:
+        for name, entry in _bg_registry.items():
+            if not entry["done"] and entry["proc"] and entry["proc"].poll() is None:
+                elapsed = time.time() - entry["start"]
+                tasks.append(("BG", name, elapsed))
+
+    if not tasks:
+        print(f"\n{Y}  No running tasks.{RST}")
+        return "cancel", None
+
+    print(f"\n{Y}{'─'*50}{RST}")
+    print(f"{W}  Running tasks:{RST}")
+    for i, (kind, name, elapsed) in enumerate(tasks, 1):
+        mins, secs = divmod(int(elapsed), 60)
+        print(f"    [{W}{i}{RST}] {C}{name:20s}{RST} ({kind}, {mins}m {secs:02d}s)")
+    print(f"    [{W}A{RST}] Kill ALL tasks")
+    print(f"    [{W}C{RST}] Cancel — resume waiting")
+    print(f"{Y}{'─'*50}{RST}")
+
+    try:
+        choice = input(f"  {Y}Kill which? > {RST}").strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        return "abort", None
+
+    if choice == "C" or choice == "":
+        return "cancel", None
+    elif choice == "A":
+        return "kill_all", None
+    elif choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(tasks):
+            return "kill_one", tasks[idx][1]
+
+    return "cancel", None
+
+
+def _kill_bg_task(name):
+    """Kill a specific background task by name."""
+    with _bg_lock:
+        entry = _bg_registry.get(name)
+        if not entry or entry["done"]:
+            return
+        if entry["proc"] and entry["proc"].poll() is None:
+            _kill_proc(entry["proc"])
+        entry["done"] = True
+        entry["status"] = "killed"
+    warn(f"Killed background task: {name}")
+
+
+def _kill_all_bg():
+    """Kill every running background task."""
+    with _bg_lock:
+        for name, entry in _bg_registry.items():
+            if not entry["done"] and entry["proc"] and entry["proc"].poll() is None:
+                _kill_proc(entry["proc"])
+                entry["done"] = True
+                entry["status"] = "killed"
+    warn("Killed all background tasks")
+
+
+def run_background(task_name, phase_func, *args):
+    """Launch a phase function in a background thread."""
+    def _wrapper():
+        _bg_mode.active = True
+        _bg_mode.name = task_name
+        start_t = time.time()
+        with _bg_lock:
+            _bg_registry[task_name] = {
+                "thread": threading.current_thread(),
+                "proc": None,
+                "start": start_t,
+                "done": False,
+                "status": "running",
+            }
+        try:
+            phase_func(*args)
+            with _bg_lock:
+                if _bg_registry[task_name]["status"] != "killed":
+                    _bg_registry[task_name]["status"] = "completed"
+        except Exception as e:
+            with _bg_lock:
+                if _bg_registry[task_name]["status"] != "killed":
+                    _bg_registry[task_name]["status"] = "failed"
+            err(f"failed: {e}")
+        finally:
+            elapsed = time.time() - start_t
+            mins, secs = divmod(int(elapsed), 60)
+            with _bg_lock:
+                _bg_registry[task_name]["done"] = True
+                status = _bg_registry[task_name]["status"]
+            if status == "completed":
+                ok(f"[BG] {task_name} complete ({mins}m {secs:02d}s)")
+
+    t = threading.Thread(target=_wrapper, name=task_name, daemon=True)
+    t.start()
+    return t
+
+
+def wait_all_bg():
+    """Block until all background tasks finish. Ctrl+C opens kill menu."""
+    pending = [n for n, e in _bg_registry.items() if not e["done"]]
+    if not pending:
+        return
+    info(f"Waiting for {len(pending)} background task(s): {C}{', '.join(pending)}{RST}")
+    for name in list(pending):
+        entry = _bg_registry[name]
+        while entry["thread"].is_alive():
+            try:
+                entry["thread"].join(timeout=0.5)
+            except KeyboardInterrupt:
+                action, target_name = _show_kill_menu()
+                if action == "kill_one":
+                    _kill_bg_task(target_name)
+                elif action == "kill_all":
+                    _kill_all_bg()
+                    return
+                elif action == "abort":
+                    _kill_all_bg()
+                    raise
+
+    completed = [n for n, e in _bg_registry.items() if e["status"] == "completed"]
+    killed_list = [n for n, e in _bg_registry.items() if e["status"] == "killed"]
+    failed_list = [n for n, e in _bg_registry.items() if e["status"] == "failed"]
+    if completed:
+        ok(f"Background completed: {C}{', '.join(completed)}{RST}")
+    if killed_list:
+        warn(f"Background killed: {', '.join(killed_list)}")
+    if failed_list:
+        err(f"Background failed: {', '.join(failed_list)}")
 
 # ─── Phases ────────────────────────────────────────────────────────────────────
 
@@ -455,7 +679,7 @@ Examples:
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"results_{target.replace('.','_')}_{date_str}")
     out_dir.mkdir(parents=True, exist_ok=True)
     ok(f"Output directory: {out_dir.resolve()}")
-    info(f"Tip: Press {W}Ctrl+C{RST} during any tool to skip it and continue the pipeline")
+    info(f"Tip: Press {W}Ctrl+C{RST} during any tool to open the task manager (skip/kill tasks)")
 
     sub_file   = out_dir / "subdomains.txt"
     live_file  = out_dir / "live.txt"
@@ -465,29 +689,37 @@ Examples:
     tg = lambda msg: send_telegram(args.tg_token, args.tg_chat, msg) if args.telegram else None
 
     # ── Run phases based on mode ──
+    # Independent phases fire as background threads; the critical dependency
+    # chain (subdomains → live hosts → crawl → XSS) stays in the foreground.
     try:
         if args.mode in ("scan", "recon"):
-            sub_file   = phase1_subdomains(target, out_dir)
-            live_file  = phase2_live_hosts(out_dir, sub_file)
-            phase3_port_scan(out_dir, live_file)
+            sub_file = phase1_subdomains(target, out_dir)
+
+            run_background("dorks", phase5_google_dorks, target)
+            live_file = phase2_live_hosts(out_dir, sub_file)
+
+            run_background("port_scan", phase3_port_scan, out_dir, live_file)
             urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
-            #phase5_google_dorks(target)
+
             tg(f"🎯 Recon done for `{target}`\nSubdomains: {count_lines(sub_file)} | Live: {count_lines(live_file)}")
 
         if args.mode in ("scan", "vuln"):
             if not live_file.exists():
                 err(f"{live_file} not found. Run recon first.")
                 sys.exit(1)
-            phase6_vuln_scan(out_dir, live_file)
+            run_background("nuclei", phase6_vuln_scan, out_dir, live_file)
+            run_background("takeover", phase8_takeover, out_dir, sub_file)
             phase7_xss(out_dir, params_file)
-            phase8_takeover(out_dir, sub_file)
             tg(f"🔍 Vuln scan done for `{target}`")
+
+        wait_all_bg()
 
         if args.mode in ("scan", "report"):
             phase9_report(target, out_dir, date_str)
             tg(f"📄 Report ready for `{target}` at `{out_dir}/report.md`")
 
     except KeyboardInterrupt:
+        _kill_all_bg()
         warn("\nInterrupted by user. Partial results saved.")
         sys.exit(0)
 
