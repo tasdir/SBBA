@@ -344,9 +344,8 @@ def phase6_vuln_scan(out_dir, live_file):
     if not tool_exists("nuclei"):
         err("nuclei not found. Install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
         return
-    tags = "cve,misconfiguration,exposed-panels,takeover,xss,sqli,ssrf,default-login"
     live_count = count_lines(live_file)
-    run(f"nuclei -l {live_file} -tags {tags} -rl 50 -o {vulns_file} -silent", tool_name="nuclei", input_count=live_count)
+    run(f"nuclei -l {live_file} -severity critical,high,medium,low -rl 50 -o {vulns_file} -silent", tool_name="nuclei", input_count=live_count)
     n = count_lines(vulns_file)
     if n:
         ok(f"{n} findings → {vulns_file}")
@@ -364,7 +363,7 @@ def phase7_xss(out_dir, params_file):
     if param_count == 0:
         info("No parameter URLs to test for XSS.")
         return
-    run(f"dalfox file {params_file} --silence --no-spinner -o {xss_file}", tool_name="dalfox", input_count=param_count)
+    run(f"dalfox file {params_file} --silence --follow-redirects --timeout 13 --no-spinner -o {xss_file}", tool_name="dalfox", input_count=param_count)
     n = count_lines(xss_file)
     if n:
         ok(f"{n} XSS findings → {xss_file}")
@@ -539,7 +538,7 @@ Examples:
             live_file  = phase2_live_hosts(out_dir, sub_file)
             phase3_port_scan(out_dir, live_file)
             urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
-            phase5_google_dorks(target)
+            #phase5_google_dorks(target)
             tg(f"🎯 Recon done for `{target}`\nSubdomains: {count_lines(sub_file)} | Live: {count_lines(live_file)}")
 
         if args.mode in ("scan", "vuln"):
