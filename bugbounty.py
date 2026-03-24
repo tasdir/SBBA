@@ -55,68 +55,20 @@ def warn(msg):  print(f"{Y}[!]{RST} {msg}")
 def err(msg):   print(f"{R}[-]{RST} {msg}")
 def phase(n, title): print(f"\n{C}{BOLD}{'─'*60}{RST}\n{M}{BOLD}  Phase {n} — {title}{RST}\n{C}{BOLD}{'─'*60}{RST}")
 
-# ─── Tool Timeout Configuration ───────────────────────────────────────────────
-# Dynamic timeouts: total = base + (per_item × input_count)
-# base  — minimum time even for 1 target (startup, DNS, handshake overhead)
-# per_item — extra seconds per host / URL / subdomain the tool processes
-# Idle timeout kills a tool only when it stops producing ANY output.
-
-TOOL_TIMEOUTS = {
-    #                  base   per_item
-    "subfinder":      (300,    0),     # single domain lookup
-    "assetfinder":    (300,    0),     # single domain lookup
-    "amass":          (600,    0),     # single domain, passive enum is slow
-    "httpx":          (120,    3),     # ~3s per subdomain to probe
-    "gowitness":      (120,    5),     # ~5s per host for screenshot
-    "nmap":           (300,   60),     # full port scan ≈ 60s/host at -T4
-    "katana":         (180,   10),     # crawl depth 3 ≈ 10s/host
-    "gau":            (300,    0),     # single domain archive lookup
-    "waybackurls":    (300,    0),     # single domain archive lookup
-    "nuclei":         (300,   15),     # templates × hosts ≈ 15s/host
-    "dalfox":         (180,    5),     # ~5s per param URL for XSS
-    "gf":             (60,     0),     # instant pattern filter
-    "grep":           (30,     0),     # local file read
-}
-DEFAULT_TIMEOUT = (600, 0)
-IDLE_TIMEOUT    = 120   # seconds with zero output before we consider a tool stuck
-
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
 def tool_exists(name):
     return shutil.which(name) is not None
 
-def _terminate_proc(proc):
-    """Best-effort terminate → kill."""
-    try:
-        proc.terminate()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=5)
-    except (subprocess.TimeoutExpired, OSError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
-
-def run(cmd, output_file=None, shell=True, tool_name=None, input_count=1):
+def run(cmd, output_file=None, shell=True, tool_name=None):
     """
     Streams stdout/stderr in real-time via Popen.
-
-    Three layers of protection:
-      1. Dynamic wall-clock timeout  = base + (per_item × input_count)
-      2. Idle timeout — no output for IDLE_TIMEOUT seconds → kill
-         (disabled for commands using shell redirect '>')
-      3. Ctrl+C skips the current tool without aborting the pipeline
+    No timeout — every tool runs until it finishes naturally.
+    Ctrl+C skips the current tool without aborting the pipeline.
     """
-    base, per_item = TOOL_TIMEOUTS.get(tool_name, DEFAULT_TIMEOUT) if tool_name else DEFAULT_TIMEOUT
-    max_timeout = base + per_item * max(input_count, 1)
-    has_redirect = ">" in cmd
-    idle_limit = max_timeout if has_redirect else IDLE_TIMEOUT
-
     info(f"Running: {Y}{cmd}{RST}")
     if tool_name:
-        info(f"{C}{tool_name}{RST} | {W}{input_count} target(s){RST} | max {max_timeout}s | idle {idle_limit}s | {W}Ctrl+C to skip{RST}")
+        info(f"{C}{tool_name}{RST} | {W}Ctrl+C to skip{RST}")
 
     try:
         proc = subprocess.Popen(
@@ -128,13 +80,9 @@ def run(cmd, output_file=None, shell=True, tool_name=None, input_count=1):
         return ""
 
     stdout_lines = []
-    last_activity = [time.time()]
-    lock = threading.Lock()
 
     def _read_stream(stream, collector=None, is_stderr=False):
         for line in iter(stream.readline, ""):
-            with lock:
-                last_activity[0] = time.time()
             if collector is not None:
                 collector.append(line)
             stripped = line.rstrip()
@@ -153,27 +101,20 @@ def run(cmd, output_file=None, shell=True, tool_name=None, input_count=1):
     killed = False
     start = time.time()
     try:
-        while proc.poll() is None:
-            time.sleep(0.5)
-            elapsed = time.time() - start
-            with lock:
-                idle = time.time() - last_activity[0]
-
-            if idle > idle_limit:
-                warn(f"No output for {int(idle)}s — killing {tool_name or 'process'}")
-                _terminate_proc(proc)
-                killed = True
-                break
-
-            if elapsed > max_timeout:
-                warn(f"Wall-clock limit ({max_timeout}s) reached — killing {tool_name or 'process'}")
-                _terminate_proc(proc)
-                killed = True
-                break
-
+        proc.wait()
     except KeyboardInterrupt:
         warn(f"Skipping {tool_name or 'current tool'}...")
-        _terminate_proc(proc)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
         killed = True
 
     t_out.join(timeout=2)
@@ -225,7 +166,7 @@ def phase1_subdomains(target, out_dir):
         ("amass",       f"amass enum -passive -d {target} -o {out_dir}/sub_amass.txt"),
     ]:
         if tool_exists(tool):
-            run(cmd, tool_name=tool, input_count=1)
+            run(cmd, tool_name=tool)
             tmp_files.append(out_dir / f"sub_{tool}.txt")
         else:
             warn(f"{tool} not found — skipping (install: go install github.com/projectdiscovery/{tool}/v2/cmd/{tool}@latest)")
@@ -248,16 +189,14 @@ def phase2_live_hosts(out_dir, sub_file):
     if not tool_exists("httpx"):
         err("httpx not found. Install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
         return live_file
-    sub_count = count_lines(sub_file)
-    run(f"httpx -l {sub_file} -silent -threads 50 -o {live_file}", tool_name="httpx", input_count=sub_count)
+    run(f"httpx -l {sub_file} -silent -threads 50 -o {live_file}", tool_name="httpx")
     ok(f"{count_lines(live_file)} live hosts → {live_file}")
 
     if tool_exists("gowitness"):
         info("Taking screenshots with gowitness...")
         sc_dir = out_dir / "screenshots"
         sc_dir.mkdir(exist_ok=True)
-        live_count = count_lines(live_file)
-        run(f"gowitness file -f {live_file} -P {sc_dir} --no-http", tool_name="gowitness", input_count=live_count)
+        run(f"gowitness file -f {live_file} -P {sc_dir} --no-http", tool_name="gowitness")
         ok(f"Screenshots saved to {sc_dir}")
     else:
         warn("gowitness not found — skipping screenshots")
@@ -276,10 +215,10 @@ def phase3_port_scan(out_dir, live_file):
     # cap at 50 hosts — scanning more than that at once gets messy
     tmp = out_dir / "_nmap_hosts.txt"
     tmp.write_text("\n".join(clean) + "\n")
-    run(f"nmap -T4 -p 1-65535 --open -iL {tmp} -oN {ports_file}", tool_name="nmap", input_count=len(clean))
+    run(f"nmap -T4 -p 1-65535 --open -iL {tmp} -oN {ports_file}", tool_name="nmap")
     ok(f"Port scan results → {ports_file}")
     # Flag unusual ports
-    unusual = run(f"grep 'open' {ports_file} | grep -vE '(80|443|8080|8443)/tcp'", tool_name="grep", input_count=1)
+    unusual = run(f"grep 'open' {ports_file} | grep -vE '(80|443|8080|8443)/tcp'", tool_name="grep")
     if unusual:
         warn(f"Unusual open ports found:\n{unusual}")
 
@@ -290,16 +229,13 @@ def phase4_crawl_urls(target, out_dir, live_file):
     params_file= out_dir / "params.txt"
     all_urls   = set()
 
-    live_count = count_lines(live_file)
-    tool_counts = {"katana": live_count, "gau": 1, "waybackurls": 1}
-
     for tool, cmd in [
         ("katana",       f"katana -list {live_file} -silent -jc -d 3 -o {out_dir}/urls_katana.txt"),
         ("gau",          f"gau {target} --o {out_dir}/urls_gau.txt"),
         ("waybackurls",  f"echo {target} | waybackurls > {out_dir}/urls_wayback.txt"),
     ]:
         if tool_exists(tool):
-            run(cmd, tool_name=tool, input_count=tool_counts[tool])
+            run(cmd, tool_name=tool)
         else:
             warn(f"{tool} not found — skipping")
 
@@ -344,8 +280,7 @@ def phase6_vuln_scan(out_dir, live_file):
     if not tool_exists("nuclei"):
         err("nuclei not found. Install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
         return
-    live_count = count_lines(live_file)
-    run(f"nuclei -l {live_file} -severity critical,high,medium,low -rl 50 -o {vulns_file} -silent", tool_name="nuclei", input_count=live_count)
+    run(f"nuclei -l {live_file} -severity critical,high,medium,low -rl 50 -o {vulns_file} -silent", tool_name="nuclei")
     n = count_lines(vulns_file)
     if n:
         ok(f"{n} findings → {vulns_file}")
@@ -359,11 +294,10 @@ def phase7_xss(out_dir, params_file):
     if not tool_exists("dalfox"):
         err("dalfox not found. Install: go install github.com/hahwul/dalfox/v2@latest")
         return
-    param_count = count_lines(params_file)
-    if param_count == 0:
+    if count_lines(params_file) == 0:
         info("No parameter URLs to test for XSS.")
         return
-    run(f"dalfox file {params_file} --silence --follow-redirects --timeout 13 --no-spinner -o {xss_file}", tool_name="dalfox", input_count=param_count)
+    run(f"dalfox file {params_file} --silence --follow-redirects --timeout 13 --no-spinner -o {xss_file}", tool_name="dalfox")
     n = count_lines(xss_file)
     if n:
         ok(f"{n} XSS findings → {xss_file}")
@@ -377,8 +311,7 @@ def phase8_takeover(out_dir, sub_file):
     if not tool_exists("nuclei"):
         err("nuclei not found — skipping takeover check")
         return
-    sub_count = count_lines(sub_file)
-    run(f"nuclei -l {sub_file} -t takeovers/ -o {takeover_file} -silent", tool_name="nuclei", input_count=sub_count)
+    run(f"nuclei -l {sub_file} -t takeovers/ -o {takeover_file} -silent", tool_name="nuclei")
     n = count_lines(takeover_file)
     if n:
         ok(f"{n} potential takeovers → {takeover_file}")

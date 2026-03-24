@@ -1,8 +1,4 @@
-# Ettercap — Bug Bounty Automation Pipeline
 
-> A personal recon and vulnerability scanning automation tool I put together to stop repeating the same manual steps on every new target. Give it a domain, it does the rest.
-
----
 
 ## What it does
 
@@ -110,4 +106,3 @@ This tool is for authorized security testing only. Only run it against targets y
 
 ---
 
-**Author:** Omair Temurian
