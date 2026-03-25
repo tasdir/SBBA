@@ -697,7 +697,7 @@ Examples:
         if args.mode in ("scan", "recon"):
             sub_file = phase1_subdomains(target, out_dir)
 
-            run_background("dorks", phase5_google_dorks, target)
+            #run_background("dorks", phase5_google_dorks, target)
             live_file = phase2_live_hosts(out_dir, sub_file)
             
             run_background("port_scan", phase3_port_scan, out_dir, live_file)
