@@ -699,7 +699,7 @@ Examples:
 
             run_background("dorks", phase5_google_dorks, target)
             live_file = phase2_live_hosts(out_dir, sub_file)
-            sendacunetix(live_file) //sendacunetixtest
+            
             run_background("port_scan", phase3_port_scan, out_dir, live_file)
             urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
 
@@ -709,6 +709,7 @@ Examples:
             if not live_file.exists():
                 err(f"{live_file} not found. Run recon first.")
                 sys.exit(1)
+            sendacunetix(live_file) # send live hosts to acunetix
             run_background("nuclei", phase6_vuln_scan, out_dir, live_file)
             run_background("takeover", phase8_takeover, out_dir, sub_file)
             phase7_xss(out_dir, params_file)
