@@ -426,6 +426,8 @@ def phase2_live_hosts(out_dir, sub_file):
         warn("gowitness not found — skipping screenshots")
     return live_file
 
+def sendacunetix(live_file):
+    run(f"python3 senderacunetix.py --file {live_file}", tool_name="senderacunetix")
 
 def phase3_port_scan(out_dir, live_file):
     phase(3, "Port Scanning")
@@ -697,7 +699,7 @@ Examples:
 
             run_background("dorks", phase5_google_dorks, target)
             live_file = phase2_live_hosts(out_dir, sub_file)
-
+            sendacunetix(live_file) //sendacunetixtest
             run_background("port_scan", phase3_port_scan, out_dir, live_file)
             urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
 
