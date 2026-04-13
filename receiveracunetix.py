@@ -15,10 +15,10 @@ Pipeline:
 import os
 import json
 import time
+import sqlite3
 import logging
 import threading
 import requests
-from queue import Queue
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from functools import wraps
@@ -207,9 +207,142 @@ def get_tracking_summary() -> dict:
 
 
 # ──────────────────────────────────────────────
-# GLOBAL STATE
+# PERSISTENT SQLITE QUEUE
+# Survives crashes/restarts — no domain is ever lost
 # ──────────────────────────────────────────────
-subdomain_queue: Queue = Queue()
+QUEUE_DB = Path("subdomain_queue.db")
+
+
+class PersistentQueue:
+    """Thread-safe, crash-proof FIFO queue backed by SQLite."""
+
+    def __init__(self, db_path: Path):
+        self._db_path = str(db_path)
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _init_db(self):
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS queue (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url        TEXT    NOT NULL,
+                    source     TEXT    NOT NULL,
+                    received_at TEXT   NOT NULL,
+                    status     TEXT    NOT NULL DEFAULT 'pending'
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS seen_urls (
+                    url  TEXT PRIMARY KEY,
+                    first_seen TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status)")
+
+    def put(self, item: dict) -> bool:
+        """Enqueue an item. Returns False if the URL was already seen (dedup)."""
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute("SELECT 1 FROM seen_urls WHERE url = ?", (item["url"],)).fetchone()
+                if row:
+                    return False
+                conn.execute(
+                    "INSERT INTO seen_urls (url, first_seen) VALUES (?, ?)",
+                    (item["url"], item["received_at"])
+                )
+                conn.execute(
+                    "INSERT INTO queue (url, source, received_at) VALUES (?, ?, ?)",
+                    (item["url"], item["source"], item["received_at"])
+                )
+            self._not_empty.notify()
+            return True
+
+    def put_batch(self, items: list[dict]) -> list[dict]:
+        """Enqueue multiple items atomically. Returns the list that was actually queued (deduped)."""
+        queued = []
+        with self._lock:
+            with self._conn() as conn:
+                for item in items:
+                    row = conn.execute("SELECT 1 FROM seen_urls WHERE url = ?", (item["url"],)).fetchone()
+                    if row:
+                        continue
+                    conn.execute(
+                        "INSERT INTO seen_urls (url, first_seen) VALUES (?, ?)",
+                        (item["url"], item["received_at"])
+                    )
+                    conn.execute(
+                        "INSERT INTO queue (url, source, received_at) VALUES (?, ?, ?)",
+                        (item["url"], item["source"], item["received_at"])
+                    )
+                    queued.append(item)
+            if queued:
+                self._not_empty.notify()
+        return queued
+
+    def get(self, timeout=None) -> "dict | None":
+        """Block until an item is available, then return it."""
+        with self._not_empty:
+            while True:
+                with self._conn() as conn:
+                    row = conn.execute(
+                        "SELECT id, url, source, received_at FROM queue WHERE status = 'pending' ORDER BY id LIMIT 1"
+                    ).fetchone()
+                if row:
+                    rid, url, source, received_at = row
+                    with self._conn() as conn:
+                        conn.execute("UPDATE queue SET status = 'processing' WHERE id = ?", (rid,))
+                    return {"_qid": rid, "url": url, "source": source, "received_at": received_at}
+                if not self._not_empty.wait(timeout=2):
+                    continue
+
+    def task_done(self, item: dict):
+        """Mark an item as completed and remove it from the queue."""
+        qid = item.get("_qid")
+        if qid is None:
+            return
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute("DELETE FROM queue WHERE id = ?", (qid,))
+
+    def task_failed(self, item: dict):
+        """Put item back to pending so it will be retried."""
+        qid = item.get("_qid")
+        if qid is None:
+            return
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute("UPDATE queue SET status = 'pending' WHERE id = ?", (qid,))
+            self._not_empty.notify()
+
+    def qsize(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM queue WHERE status IN ('pending', 'processing')").fetchone()
+            return row[0] if row else 0
+
+    def pending_count(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM queue WHERE status = 'pending'").fetchone()
+            return row[0] if row else 0
+
+    def recover_stale(self):
+        """On startup, reset any 'processing' rows back to 'pending' (crashed mid-work)."""
+        with self._lock:
+            with self._conn() as conn:
+                cur = conn.execute("UPDATE queue SET status = 'pending' WHERE status = 'processing'")
+                if cur.rowcount:
+                    log.info(f"[QUEUE-DB] Recovered {cur.rowcount} stale item(s) from previous run")
+            self._not_empty.notify()
+
+
+subdomain_queue: PersistentQueue = PersistentQueue(QUEUE_DB)
 
 # { scan_id: { target_id, url, started_at } }
 active_scans: dict = {}
@@ -237,6 +370,7 @@ def submit_subdomains():
     """
     POST /submit
     Body: { "source": "recon-vps-01", "subdomains": ["sub.example.com", ...] }
+    Deduplicates automatically — safe to call repeatedly with overlapping lists.
     """
     data = request.get_json(force=True, silent=True)
     if not data or "subdomains" not in data:
@@ -248,26 +382,29 @@ def submit_subdomains():
     if not isinstance(subdomains, list):
         return jsonify({"error": "'subdomains' must be a list"}), 400
 
-    normalized = []
+    now = _now()
+    items = []
     for s in subdomains:
         s = s.strip()
         if s and not s.startswith(("http://", "https://")):
             s = f"https://{s}"
         if s:
-            normalized.append(s)
+            items.append({"url": s, "source": source, "received_at": now})
 
-    for sub in normalized:
-        subdomain_queue.put({
-            "url":         sub,
-            "source":      source,
-            "received_at": _now()
-        })
-        track_queued(sub, source)
+    queued_items = subdomain_queue.put_batch(items)
+    skipped = len(items) - len(queued_items)
 
-    log.info(f"[RECV] {len(normalized)} subdomains queued from '{source}' | depth: {subdomain_queue.qsize()}")
+    for item in queued_items:
+        track_queued(item["url"], source)
+
+    log.info(
+        f"[RECV] {len(queued_items)} new / {skipped} duplicate(s) skipped "
+        f"from '{source}' | depth: {subdomain_queue.qsize()}"
+    )
     return jsonify({
         "status":     "queued",
-        "queued":     len(normalized),
+        "queued":     len(queued_items),
+        "duplicates_skipped": skipped,
         "queue_size": subdomain_queue.qsize()
     }), 202
 
@@ -422,13 +559,15 @@ def queue_worker():
     log.info("[QUEUE] Worker started.")
     while True:
         item = subdomain_queue.get()
+        if item is None:
+            continue
         url  = item["url"]
         log.info(f"[QUEUE] ► {url}  (from: {item['source']})")
 
         target_id = acu_add_target(url)
         if not target_id:
             track_failed(url, "target_add_failed")
-            subdomain_queue.task_done()
+            subdomain_queue.task_done(item)
             time.sleep(QUEUE_DELAY)
             continue
 
@@ -442,12 +581,12 @@ def queue_worker():
                     "url":        url,
                     "started_at": _now()
                 }
+            subdomain_queue.task_done(item)
         else:
-            # Scan trigger failed → delete orphan target, mark failed
             acu_delete_target(target_id, url)
             track_failed(url, "scan_trigger_failed")
+            subdomain_queue.task_done(item)
 
-        subdomain_queue.task_done()
         time.sleep(QUEUE_DELAY)
 
 
@@ -530,8 +669,14 @@ if __name__ == "__main__":
             _save_tracking(d)
         log.info(f"[TRACK] Initialized tracking file: {TRACKING_FILE}")
 
+    # Recover any items that were mid-processing when we last crashed/stopped
+    subdomain_queue.recover_stale()
+    pending = subdomain_queue.pending_count()
+    if pending:
+        log.info(f"[QUEUE-DB] {pending} subdomain(s) pending from previous run — will resume")
+
     threading.Thread(target=queue_worker,   daemon=True, name="queue-worker").start()
     threading.Thread(target=cleanup_worker, daemon=True, name="cleanup-worker").start()
 
     log.info(f"[SERVER] Starting on port {RECEIVER_PORT}  |  keep={KEEP_SEVERITIES}  |  poll={CLEANUP_POLL_INTERVAL}s")
-    app.run(host="0.0.0.0", port=RECEIVER_PORT, debug=False)
+    app.run(host="0.0.0.0", port=RECEIVER_PORT, threaded=True, debug=False)
