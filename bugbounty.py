@@ -648,84 +648,126 @@ def main():
         epilog="""
 Examples:
   python3 bugbounty.py scan target.com
+  python3 bugbounty.py scan -l domains.txt
+  python3 bugbounty.py recon -l targets.txt --telegram --tg-token TOKEN --tg-chat CHATID
   python3 bugbounty.py recon target.com
   python3 bugbounty.py vuln target.com
   python3 bugbounty.py report target.com --out-dir results_target.com_2026-03-22
-  python3 bugbounty.py scan target.com --telegram --tg-token TOKEN --tg-chat CHATID
         """
     )
     parser.add_argument("mode",   choices=["scan","recon","vuln","report"], help="Pipeline mode")
-    parser.add_argument("target", help="Target domain (e.g. example.com)")
-    parser.add_argument("--out-dir",  help="Override output directory path")
+    parser.add_argument("target", nargs="?", help="Target domain (e.g. example.com)")
+    parser.add_argument("-l", "--list", dest="domain_list", help="File with one domain per line (auto-skips confirmation)")
+    parser.add_argument("--out-dir",  help="Override output directory path (only for single-target mode)")
     parser.add_argument("--telegram", action="store_true", help="Send findings to Telegram")
     parser.add_argument("--tg-token", help="Telegram bot token")
     parser.add_argument("--tg-chat",  help="Telegram chat ID")
     parser.add_argument("--skip-confirm", action="store_true", help="Skip scope confirmation prompt")
     args = parser.parse_args()
 
-    target   = args.target.lower().strip()
-    date_str = datetime.date.today().isoformat()
+    # ── Build target list ──
+    if args.domain_list:
+        list_path = Path(args.domain_list)
+        if not list_path.exists():
+            err(f"Domain list not found: {args.domain_list}")
+            sys.exit(1)
+        targets = [l.strip().lower() for l in list_path.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+        if not targets:
+            err("Domain list is empty.")
+            sys.exit(1)
+        ok(f"Loaded {len(targets)} domain(s) from {args.domain_list}")
+    elif args.target:
+        targets = [args.target.lower().strip()]
+    else:
+        err("Provide a target domain or use -l/--list with a domain file.")
+        parser.print_help()
+        sys.exit(1)
 
-    # ── Scope confirmation ──
-    if not args.skip_confirm:
+    date_str = datetime.date.today().isoformat()
+    skip_confirm = args.skip_confirm or args.domain_list is not None
+
+    # ── Scope confirmation (once for all domains) ──
+    if not skip_confirm:
         print(f"\n{Y}{BOLD}⚠️  SCOPE CONFIRMATION{RST}")
-        print(f"  Target : {W}{target}{RST}")
+        print(f"  Target : {W}{targets[0]}{RST}")
         print(f"  Mode   : {W}{args.mode}{RST}")
         print(f"\n{R}You must have explicit written permission to test this target.{RST}")
-        ans = input(f"\n{Y}Confirm {target} is in-scope and you have permission? [yes/NO]: {RST}").strip().lower()
+        ans = input(f"\n{Y}Confirm target(s) are in-scope and you have permission? [yes/NO]: {RST}").strip().lower()
         if ans != "yes":
             err("Aborted. Only test targets you are authorized to test.")
             sys.exit(1)
-
-    # ── Output directory ──
-    out_dir = Path(args.out_dir) if args.out_dir else Path(f"results_{target.replace('.','_')}_{date_str}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ok(f"Output directory: {out_dir.resolve()}")
-    info(f"Tip: Press {W}Ctrl+C{RST} during any tool to open the task manager (skip/kill tasks)")
-
-    sub_file   = out_dir / "subdomains.txt"
-    live_file  = out_dir / "live.txt"
-    urls_file  = out_dir / "urls.txt"
-    params_file= out_dir / "params.txt"
+    elif args.domain_list:
+        info(f"Confirmation auto-skipped for batch mode ({len(targets)} domains)")
 
     tg = lambda msg: send_telegram(args.tg_token, args.tg_chat, msg) if args.telegram else None
 
-    # ── Run phases based on mode ──
-    # Independent phases fire as background threads; the critical dependency
-    # chain (subdomains → live hosts → crawl → XSS) stays in the foreground.
-    try:
-        if args.mode in ("scan", "recon"):
-            sub_file = phase1_subdomains(target, out_dir)
+    # ── Process each target ──
+    for idx, target in enumerate(targets, 1):
+        if len(targets) > 1:
+            print(f"\n{M}{BOLD}{'═'*60}{RST}")
+            print(f"{W}{BOLD}  [{idx}/{len(targets)}]  {C}{target}{RST}")
+            print(f"{M}{BOLD}{'═'*60}{RST}")
 
-            #run_background("dorks", phase5_google_dorks, target)
-            live_file = phase2_live_hosts(out_dir, sub_file)
-            sendacunetix(live_file) # send live hosts to acunetix
-            
-            run_background("port_scan", phase3_port_scan, out_dir, live_file)
-            urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
+        # ── Output directory ──
+        if args.out_dir and len(targets) == 1:
+            out_dir = Path(args.out_dir)
+        else:
+            out_dir = Path(f"results_{target.replace('.','_')}_{date_str}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ok(f"Output directory: {out_dir.resolve()}")
+        info(f"Tip: Press {W}Ctrl+C{RST} during any tool to open the task manager (skip/kill tasks)")
 
-            tg(f"🎯 Recon done for `{target}`\nSubdomains: {count_lines(sub_file)} | Live: {count_lines(live_file)}")
+        sub_file   = out_dir / "subdomains.txt"
+        live_file  = out_dir / "live.txt"
+        urls_file  = out_dir / "urls.txt"
+        params_file= out_dir / "params.txt"
 
-        if args.mode in ("scan", "vuln"):
-            if not live_file.exists():
-                err(f"{live_file} not found. Run recon first.")
-                sys.exit(1)
-            
-            run_background("nuclei", phase6_vuln_scan, out_dir, live_file)
-            run_background("takeover", phase8_takeover, out_dir, sub_file)
-            phase7_xss(out_dir, params_file)
-            tg(f"🔍 Vuln scan done for `{target}`")
+        try:
+            if args.mode in ("scan", "recon"):
+                sub_file = phase1_subdomains(target, out_dir)
 
-        wait_all_bg()
+                #run_background("dorks", phase5_google_dorks, target)
+                live_file = phase2_live_hosts(out_dir, sub_file)
+                sendacunetix(live_file) # send live hosts to acunetix
 
-        if args.mode in ("scan", "report"):
-            phase9_report(target, out_dir, date_str)
-            tg(f"📄 Report ready for `{target}` at `{out_dir}/report.md`")
+                run_background("port_scan", phase3_port_scan, out_dir, live_file)
+                urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
 
-    except KeyboardInterrupt:
-        _kill_all_bg()
-        warn("\nInterrupted by user. Partial results saved.")
-        sys.exit(0)
+                tg(f"🎯 Recon done for `{target}`\nSubdomains: {count_lines(sub_file)} | Live: {count_lines(live_file)}")
+
+            if args.mode in ("scan", "vuln"):
+                if not live_file.exists():
+                    err(f"{live_file} not found. Run recon first.")
+                    if len(targets) > 1:
+                        warn(f"Skipping {target}, moving to next domain...")
+                        continue
+                    sys.exit(1)
+
+                run_background("nuclei", phase6_vuln_scan, out_dir, live_file)
+                run_background("takeover", phase8_takeover, out_dir, sub_file)
+                phase7_xss(out_dir, params_file)
+                tg(f"🔍 Vuln scan done for `{target}`")
+
+            wait_all_bg()
+
+            if args.mode in ("scan", "report"):
+                phase9_report(target, out_dir, date_str)
+                tg(f"📄 Report ready for `{target}` at `{out_dir}/report.md`")
+
+        except KeyboardInterrupt:
+            _kill_all_bg()
+            warn(f"\nInterrupted during {target}. Partial results saved.")
+            if len(targets) > 1:
+                remaining = len(targets) - idx
+                if remaining > 0:
+                    warn(f"{remaining} domain(s) remaining were skipped.")
+            sys.exit(0)
+
+    if len(targets) > 1:
+        print(f"\n{G}{BOLD}{'='*60}")
+        print(f"  ✅ All {len(targets)} domains processed!")
+        print(f"{'='*60}{RST}")
+        tg(f"✅ Batch complete — {len(targets)} domains processed")
 
 
 if __name__ == "__main__":
