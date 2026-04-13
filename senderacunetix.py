@@ -20,14 +20,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 
-def send_batch(subdomains: list, source: str, receiver_url: str, secret: str) -> bool:
+def send_batch(subdomains: list, source: str, receiver_url: str, secret: str, max_retries: int) -> bool:
     """Send a batch with exponential-backoff retries. Returns True only on 202."""
     payload = {"source": source, "subdomains": subdomains}
     headers = {
         "Authorization": f"Bearer {secret}",
         "Content-Type": "application/json"
     }
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             r = requests.post(receiver_url, headers=headers, json=payload, timeout=30)
             if r.status_code == 202:
@@ -37,21 +37,21 @@ def send_batch(subdomains: list, source: str, receiver_url: str, secret: str) ->
             if r.status_code < 500:
                 log.error(f"[SEND] Server rejected batch (non-retryable): {r.status_code} {r.text[:200]}")
                 return False
-            log.warning(f"[SEND] Server error {r.status_code}, attempt {attempt}/{MAX_RETRIES}")
+            log.warning(f"[SEND] Server error {r.status_code}, attempt {attempt}/{max_retries}")
         except requests.exceptions.ConnectionError as e:
-            log.warning(f"[SEND] Connection error (attempt {attempt}/{MAX_RETRIES}): {e}")
+            log.warning(f"[SEND] Connection error (attempt {attempt}/{max_retries}): {e}")
         except requests.exceptions.Timeout:
-            log.warning(f"[SEND] Timeout (attempt {attempt}/{MAX_RETRIES})")
+            log.warning(f"[SEND] Timeout (attempt {attempt}/{max_retries})")
         except Exception as e:
             log.error(f"[SEND] Unexpected error: {e}")
             return False
 
-        if attempt < MAX_RETRIES:
+        if attempt < max_retries:
             delay = RETRY_BACKOFF * (2 ** (attempt - 1))
             log.info(f"[SEND] Retrying in {delay}s ...")
             time.sleep(delay)
 
-    log.error(f"[SEND] Batch FAILED after {MAX_RETRIES} attempts ({len(subdomains)} domains)")
+    log.error(f"[SEND] Batch FAILED after {max_retries} attempts ({len(subdomains)} domains)")
     return False
 
 
@@ -96,16 +96,13 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    global MAX_RETRIES
-    MAX_RETRIES = args.retries
-
     log.info(f"[SENDER] {len(subdomains)} subdomains loaded from source '{args.source}'")
 
     total_sent = 0
     failed_domains = []
 
     for batch in chunked(subdomains, args.batch):
-        ok = send_batch(batch, args.source, args.receiver, args.secret)
+        ok = send_batch(batch, args.source, args.receiver, args.secret, args.retries)
         if ok:
             total_sent += len(batch)
         else:
