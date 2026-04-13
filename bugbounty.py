@@ -44,9 +44,9 @@ def banner():
                                                                     
 {RST}
 {M}{'─'*70}{RST}
-{W}   🎯  Simple Bug Bounty Automation {Y}v1.0{RST}
+{W}   🎯  Simple Bug Bounty Automation {Y} T Scope Only{RST}
 {W}   👤  Author : {G}Tasdir Ahmmed{RST}
-{W}   🔧  Phases : {C}Recon → Crawl → Vuln Scan → (Nuclei + XSS + Takeover) → Report{RST}
+{W}   🔧  Phases : {C}Subdomain → Crawl → Vuln Scan → (Nuclei + XSS + Takeover) → Report{RST}
 {M}{'─'*70}{RST}
 """)
 
@@ -379,31 +379,57 @@ def wait_all_bg():
 
 # ─── Phases ────────────────────────────────────────────────────────────────────
 
+import re
+from pathlib import Path
+
+IPV4_IN_HOST_RE = re.compile(r'(?:^|[^0-9])(?:\d{1,3}\.){3}\d{1,3}(?:[^0-9]|$)')
+
 def phase1_subdomains(target, out_dir):
     phase(1, "Subdomain Enumeration")
     sub_file = out_dir / "subdomains.txt"
     tmp_files = []
 
-    for tool, cmd in [
-        ("subfinder",   f"subfinder -d {target} -silent -o {out_dir}/sub_subfinder.txt"),
-        ("assetfinder", f"assetfinder --subs-only {target} > {out_dir}/sub_assetfinder.txt"),
-        ("amass",       f"amass enum -passive -d {target} -o {out_dir}/sub_amass.txt"),
-    ]:
+    tools = [
+        ("subfinder",   f"subfinder -d {target} -silent -o {out_dir}/sub_subfinder.txt", out_dir / "sub_subfinder.txt"),
+        ("assetfinder", f"assetfinder --subs-only {target} > {out_dir}/sub_assetfinder.txt", out_dir / "sub_assetfinder.txt"),
+        ("amass",       f"amass enum -passive -d {target} -o {out_dir}/sub_amass.txt", out_dir / "sub_amass.txt"),
+    ]
+
+    for tool, cmd, outfile in tools:
         if tool_exists(tool):
             run(cmd, tool_name=tool)
-            tmp_files.append(out_dir / f"sub_{tool}.txt")
+            tmp_files.append(outfile)
         else:
-            warn(f"{tool} not found — skipping (install: go install github.com/projectdiscovery/{tool}/v2/cmd/{tool}@latest)")
+            warn(f"{tool} not found — skipping")
 
-    # merge all three tool outputs and drop duplicates before saving
     all_subs = set()
+    removed = []
+
     for f in tmp_files:
-        p = Path(f)
-        if p.exists():
-            all_subs.update(l.strip() for l in p.read_text().splitlines() if l.strip())
-    sub_file.write_text("\n".join(sorted(all_subs)) + "\n")
-    n = count_lines(sub_file)
-    ok(f"Found {n} unique subdomains → {sub_file}")
+        if not f.exists():
+            continue
+
+        for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+            sub = line.strip().lower()
+            if not sub:
+                continue
+
+            # remove entries containing IPv4 patterns in hostname
+            if IPV4_IN_HOST_RE.search(sub):
+                removed.append(sub)
+                continue
+
+            all_subs.add(sub)
+
+    sub_file.write_text(
+        "\n".join(sorted(all_subs)) + ("\n" if all_subs else ""),
+        encoding="utf-8"
+    )
+
+    ok(f"Found {len(all_subs)} unique subdomains → {sub_file}")
+    if removed:
+        warn(f"Removed {len(set(removed))} entries containing IPv4 patterns in hostname")
+
     return sub_file
 
 
@@ -427,26 +453,8 @@ def phase2_live_hosts(out_dir, sub_file):
     return live_file
 
 def sendacunetix(live_file):
-    run(f"python3 senderacunetix.py --file {live_file}", tool_name="senderacunetix")
+     run(f"python3 senderacunetix.py --file {live_file}", tool_name="senderacunetix")
 
-def phase3_port_scan(out_dir, live_file):
-    phase(3, "Port Scanning")
-    ports_file = out_dir / "ports.txt"
-    if not tool_exists("nmap"):
-        err("nmap not found. Install: sudo apt install nmap")
-        return
-    hosts = [l.strip() for l in Path(live_file).read_text().splitlines() if l.strip()]
-    # nmap doesn't want http:// prefixes, strip them out
-    clean = [h.replace("https://","").replace("http://","").split("/")[0] for h in hosts]
-    # cap at 50 hosts — scanning more than that at once gets messy
-    tmp = out_dir / "_nmap_hosts.txt"
-    tmp.write_text("\n".join(clean) + "\n")
-    run(f"nmap -T4 -p 1-65535 --open -iL {tmp} -oN {ports_file}", tool_name="nmap")
-    ok(f"Port scan results → {ports_file}")
-    # Flag unusual ports
-    unusual = run(f"grep 'open' {ports_file} | grep -vE '(80|443|8080|8443)/tcp'", tool_name="grep")
-    if unusual:
-        warn(f"Unusual open ports found:\n{unusual}")
 
 
 def phase4_crawl_urls(target, out_dir, live_file):
@@ -473,31 +481,13 @@ def phase4_crawl_urls(target, out_dir, live_file):
     urls_file.write_text("\n".join(sorted(all_urls)) + "\n")
     ok(f"{len(all_urls)} total URLs → {urls_file}")
 
-    # anything with a "?" is worth keeping for XSS testing
+    # Keep parameterized URLs for manual or future testing
     params = [u for u in all_urls if "?" in u]
     params_file.write_text("\n".join(sorted(params)) + "\n")
     ok(f"{len(params)} parameter URLs → {params_file}")
     return urls_file, params_file
 
 
-def phase5_google_dorks(target):
-    phase(5, "Google Dorking Suggestions")
-    dorks = [
-        f'site:{target} ext:env OR ext:config OR ext:yml OR ext:yaml',
-        f'site:{target} inurl:admin OR inurl:administrator OR inurl:dashboard',
-        f'site:{target} inurl:login OR inurl:signin OR inurl:auth',
-        f'site:{target} intext:"api_key" OR intext:"access_token" OR intext:"secret"',
-        f'site:{target} filetype:sql OR filetype:db OR filetype:bak',
-        f'site:{target} inurl:".git" OR inurl:".svn" OR inurl:".DS_Store"',
-        f'site:{target} inurl:phpinfo OR inurl:test.php OR inurl:info.php',
-        f'site:{target} intitle:"index of" OR intitle:"directory listing"',
-        f'site:{target} inurl:wp-content OR inurl:wp-admin',
-        f'site:{target} intext:"mysql_connect" OR intext:"mysqli" OR intext:"pg_connect"',
-    ]
-    print(f"\n{Y}Google Dorks for {target}:{RST}")
-    for i, d in enumerate(dorks, 1):
-        print(f"  {i:2}. {d}")
-    return dorks
 
 
 def phase6_vuln_scan(out_dir, live_file):
@@ -513,22 +503,6 @@ def phase6_vuln_scan(out_dir, live_file):
     else:
         info("No nuclei findings.")
 
-
-def phase7_xss(out_dir, params_file):
-    phase(7, "XSS Testing (dalfox)")
-    xss_file = out_dir / "xss.txt"
-    if not tool_exists("dalfox"):
-        err("dalfox not found. Install: go install github.com/hahwul/dalfox/v2@latest")
-        return
-    if count_lines(params_file) == 0:
-        info("No parameter URLs to test for XSS.")
-        return
-    run(f"dalfox file {params_file} --silence --follow-redirects --timeout 13 --no-spinner -o {xss_file}", tool_name="dalfox")
-    n = count_lines(xss_file)
-    if n:
-        ok(f"{n} XSS findings → {xss_file}")
-    else:
-        info("No XSS confirmed.")
 
 
 def phase8_takeover(out_dir, sub_file):
@@ -560,7 +534,6 @@ def phase9_report(target, out_dir, date_str):
         return snippet
 
     vulns_raw     = read_safe(out_dir / "vulns.txt")
-    xss_raw       = read_safe(out_dir / "xss.txt")
     takeover_raw  = read_safe(out_dir / "takeovers.txt")
     subs_count    = count_lines(out_dir / "subdomains.txt")
     live_count    = count_lines(out_dir / "live.txt")
@@ -592,14 +565,6 @@ def phase9_report(target, out_dir, date_str):
 
 ---
 
-## 🕷️ XSS Findings (dalfox)
-
-```
-{xss_raw}
-```
-
----
-
 ## 🔗 Subdomain Takeover Candidates
 
 ```
@@ -614,12 +579,9 @@ def phase9_report(target, out_dir, date_str):
 |------|-------------|
 | `subdomains.txt` | All discovered subdomains |
 | `live.txt` | Live HTTP/HTTPS hosts |
-| `ports.txt` | Nmap port scan results |
 | `urls.txt` | All crawled URLs |
 | `params.txt` | URLs with parameters |
-| `vulns.txt` | Nuclei vulnerability findings |
-| `xss.txt` | Confirmed XSS via dalfox |
-
+| `vulns.txt` | Nuclei vulnerability findings 
 | `takeovers.txt` | Subdomain takeover candidates |
 | `screenshots/` | Visual screenshots of live hosts |
 
@@ -730,7 +692,6 @@ Examples:
                 live_file = phase2_live_hosts(out_dir, sub_file)
                 sendacunetix(live_file) # send live hosts to acunetix
 
-                run_background("port_scan", phase3_port_scan, out_dir, live_file)
                 urls_file, params_file = phase4_crawl_urls(target, out_dir, live_file)
 
                 tg(f"🎯 Recon done for `{target}`\nSubdomains: {count_lines(sub_file)} | Live: {count_lines(live_file)}")
@@ -745,7 +706,6 @@ Examples:
 
                 run_background("nuclei", phase6_vuln_scan, out_dir, live_file)
                 run_background("takeover", phase8_takeover, out_dir, sub_file)
-                phase7_xss(out_dir, params_file)
                 tg(f"🔍 Vuln scan done for `{target}`")
 
             wait_all_bg()
